@@ -1,0 +1,915 @@
+# Load required libraries
+library(bigrquery)
+library(curl)
+library(dplyr)
+library(lubridate)
+library(httpuv)
+library(base)
+library(googledrive)
+library(stringr)
+library(tidyr)
+unloadNamespace("plyr")
+
+############################################################# 
+#### META
+############################################################# 
+meta <- bq_table_download("slstrategy.EMPOWER_2025.METAREPORT_RAW", bigint = "integer64")
+
+# MISSING ADD TYPE AND CANGT LOG IN RN
+print(unique(meta$AD_NAME))
+# MIGHT FIX LATER 
+meta$MESSAGING <- meta$AD_NAME
+meta <- meta %>%
+  mutate(
+    AD_TYPE = case_when(
+      str_detect(AD_GROUP_NAME, regex("Workshop|Event|gratuito", ignore_case = TRUE)) ~ "Event Promotion",
+      str_detect(AD_GROUP_NAME, regex("Hotline", ignore_case = TRUE))               ~ "Hotlines",
+      str_detect(AD_GROUP_NAME, regex("Promotion", ignore_case = TRUE))             ~ "Program Promotion",
+      TRUE                                                                           ~ AD_NAME
+    )
+  )
+
+# CTA
+meta <- meta %>%
+  mutate(
+    CALL_TO_ACTION = case_when(
+      str_detect(AD_NAME, regex("Hotline", ignore_case = TRUE))                       ~ "Click to Call",
+      str_detect(AD_NAME, regex("^Promoting Website", ignore_case = TRUE))            ~ "Promoting Website",
+      str_detect(AD_NAME, regex("Event|Workshop|gratuito", ignore_case = TRUE))      ~ "Workshop Registration",
+      TRUE                                                                            ~ "Unspecified"
+    )
+  )
+
+# language
+meta <- meta %>%
+  mutate(
+    LANGUAGE = case_when(
+      str_detect(AD_NAME, regex("English", ignore_case = TRUE)) ~ "English",
+      str_detect(AD_NAME, regex("Spanish", ignore_case = TRUE)) ~ "Spanish",
+      TRUE                                                     ~ "Bilingual"
+    )
+  )
+
+# geography and audience 
+meta <- meta %>%
+  mutate(
+    Geography = if_else(DATE <= as.Date("2024-12-30"), "Sector 1", NA_character_),
+    Audience  = if_else(DATE <= as.Date("2024-12-30"), "Individual Automotive", NA_character_)
+  )
+
+# campaign name
+meta <- meta %>%
+  mutate(CAMPAIGN_NAME = paste("THMC emPower Gateway SouthLA", format(DATE, "%y")))
+
+
+############################################################# 
+#### TIKTOK
+############################################################# 
+tiktok <- bq_table_download("slstrategy.EMPOWER_2025.TIKTOKREPORT_RAW", bigint = "integer64")
+tiktok <- tiktok %>%
+  rename(AD_TYPE = FORMAT)
+tiktok <- tiktok %>%
+  rename(MESSAGING = TEXT)
+tiktok <- select(tiktok, -CREATIVE, -VIDEO_VIEWS, -CURRENCY)
+tiktok <- tiktok %>% filter(AD_TYPE != "-")
+
+
+# discression
+tiktok <- tiktok %>%
+  separate(
+    AD_GROUP_NAME,
+    into   = c("prefix", "Geography", "AdType", "AudienceRaw", "rest"),
+    sep    = "_",
+    remove = FALSE,
+    extra  = "merge",
+    fill   = "right"
+  ) %>%
+  mutate(
+    Geography = str_replace(
+      Geography,
+      regex("sector(\\d+)", ignore_case = TRUE),
+      "Sector \\1"
+    ),
+    Audience = AudienceRaw %>%
+      str_remove(regex("inSector\\d+", ignore_case = TRUE)) %>%  
+      str_replace_all("([a-z])([A-Z])", "\\1 \\2")               
+  ) %>%
+  select(-prefix, -AdType, -AudienceRaw, -rest)
+
+# clean language 
+tiktok <- tiktok %>%
+  mutate(
+    LANGUAGE = recode(
+      LANGUAGE,
+      "Spanish; Castilian"       = "Spanish",
+      "English(US)"              = "English",
+      "Chinese (Traditional)"    = "Chinese",
+      .default                   = LANGUAGE
+    )
+  )
+
+############################################################# 
+#### GOOGLE (YOUTUBE)
+############################################################# 
+google <- bq_table_download("slstrategy.EMPOWER_2025.YOUTUBEREPORT_RAW", bigint = "integer64")
+
+# clean up campaign col
+google <- google %>%
+  rename(CAMPAIGN_NAME = CAMPAIGN)
+google <- google %>%
+  mutate(CAMPAIGN_NAME = paste("THMC emPower Gateway SouthLA", format(DATE, "%y")))
+
+# language
+google <- google %>%
+  mutate(
+    LANGUAGE = case_when(
+      str_detect(AD_NAME, regex("SP", ignore_case = TRUE)) ~ "Spanish",
+      str_detect(AD_NAME, regex("ENG", ignore_case = TRUE)) ~ "English",
+      TRUE ~ NA_character_
+    )
+  )
+
+# cost per click
+google <- google %>%
+  mutate(
+    CPC_DESTINATION = if_else(
+      LINK_CLICKS > 0,
+      round(as.numeric(AMOUNT_SPENT_USD) / as.numeric(LINK_CLICKS), 2),
+      NA_real_
+    )
+  )
+
+# rename and remove 
+google <- google %>%
+  rename(AD_GROUP_NAME = AD_GROUP)
+google <- google %>%
+  rename(CTR_DESTINATION = CTR)
+
+google <- select(google, -AD_STATE, -AD_STATUS, -FINAL_URL, -DISPLAY_URL, -VIDEO_ID,
+                 -CURRENCY_CODE, -CAMPAIGN_TYPE, -AD_GROUP_TYPE)
+
+# audience and geos 
+google <- google %>%
+  separate(
+    AD_GROUP_NAME,
+    into   = c("prefix", "Geography", "AdType", "AudienceRaw", "rest"),
+    sep    = "_",
+    remove = FALSE,
+    extra  = "merge",
+    fill   = "right"
+  ) %>%
+  mutate(
+    Geography = str_replace(
+      Geography,
+      regex("sector(\\d+)", ignore_case = TRUE),
+      "Sector \\1"
+    ),
+    Audience = AudienceRaw %>%
+      str_remove(regex("inSector\\d+", ignore_case = TRUE)) %>%  
+      str_replace_all("([a-z])([A-Z])", "\\1 \\2")               
+  ) %>%
+  select(-prefix, -AdType, -AudienceRaw, -rest)
+
+#missing
+google$REACH <- NA_integer_
+google$CPR <- NA_real_
+google$FREQUENCY <- NA_real_
+google$VIDEO_AVERAGE_PLAY_TIME <- NA_integer_
+google$CALL_TO_ACTION <- "Program Promotion"
+google$MESSAGING <-  google$AD_NAME
+
+
+############################################################# 
+#### MERGE DIGITAL
+############################################################# 
+merge <- rbind(meta, tiktok, google)
+
+merge <- merge %>%
+  rename(CONVERSIONS = LINK_CLICKS)
+
+digital_final_temp <- merge
+
+
+############################################################# MERGE DIGITAL END
+############################################################# DIGITAL FINAL ABOVE
+#
+#
+#
+################################################## OUTREACH
+################################################## START CLEAN BELOW
+#
+################################################## 
+#  CONVOSO CALL DATA
+################################################## 
+convoso <- bq_table_download("slstrategy.EMPOWER_2025.CONVOSO_REPORTRAW", bigint = "integer64") 
+
+convoso <- convoso %>%
+  rename_with(toupper)
+
+convoso <- convoso %>%
+  # split LIST_NAME into parts
+  separate(
+    LIST_NAME,
+    into   = c("EMPOWER", "sector_raw", "language", "date"),
+    sep    = "_",
+    remove = FALSE,
+    extra  = "drop"
+  ) %>%
+  mutate(
+    # Geography: drop either "SEC" or "SECTOR" prefix, then prefix with "Sector "
+    GEOGRAPHY = paste0(
+      "Sector ",
+      str_remove(sector_raw, regex("^SEC(?:TOR)?", ignore_case = TRUE))
+    ),
+    # Language: Title‐case the language code
+    LANGUAGE = str_to_title(language),
+    # Audience: detect formats like _SEC..._<LANG>_<DATE> at end
+    AUDIENCE = if_else(
+      str_detect(
+        LIST_NAME,
+        regex("_SEC(?:TOR)?[^_]*_[^_]+_[0-9]+$", ignore_case = TRUE)
+      ),
+      "80% or below AMI",
+      "Not Defined in Script"
+    )
+  ) %>%
+  # drop helper cols
+  select(-EMPOWER, -sector_raw, -language, -date)
+
+
+# BACKUP FOR TESTING
+backup <- convoso
+
+convoso <- backup
+
+### clean
+# prelim columns that are nice to have later on
+cc <- select(convoso, -FINAL_REACH_TIME, -FINAL_REACH_DATE, -COST, -CREATED_LEAD_TIME, -CREATED_LEAD_DATE,
+             -LEAD_ID)
+
+# QC Check
+print(unique(cc$STATUS_NAME))
+
+cc <- cc %>%
+  rename(ENGAGEMENT_LENGTH = TALK_TIME) 
+
+cc <- select(cc, -SCE_CUSTOMER, -PROGRAM_RECOGNITION)
+
+# add extra conversion columns
+cc$REBATE_INTEREST <- NA_character_
+cc$PROGRAM_INTEREST <- NA_character_
+
+convoso_final <- cc
+
+################################################## 
+#  IMPACTIVE + HUBDIALER CALL DATA
+################################################## 
+convoso1 <- bq_table_download("slstrategy.EMPOWER_2025.IMPACTIVE_REPORTRAW", bigint = "integer64") 
+
+
+convoso2 <- bq_table_download("slstrategy.EMPOWER_2025.HUBDIALER_REPORTRAW", bigint = "integer64") 
+convoso2$PLATFORM <- "Hubdialer"
+convoso2$REBATE_INTEREST <- NA_character_
+convoso2$PROGRAM_INTEREST <- NA_character_
+
+convoso <- rbind(convoso1, convoso2)
+
+convoso <- convoso %>%
+  rename_with(toupper)
+
+print(unique(convoso$LIST_NAME))
+
+convoso <- convoso %>%
+  mutate(
+    sector_match = str_extract(LIST_NAME, regex("SECTOR\\d+", ignore_case = TRUE)),
+    GEOGRAPHY = if_else(
+      is.na(sector_match),
+      "Not Specified",
+      paste0("Sector ", str_remove(sector_match, regex("^SECTOR", ignore_case = TRUE)))
+    ),
+    LANGUAGE = case_when(
+      str_detect(LIST_NAME, regex("ENGLISH", ignore_case = TRUE)) ~ "English",
+      str_detect(LIST_NAME, regex("SPANISH", ignore_case = TRUE)) ~ "Spanish",
+      TRUE ~ "Bilingual"
+    ),
+    AUDIENCE = case_when(
+      str_detect(LIST_NAME, regex("QC", ignore_case = TRUE)) ~ "Quality Controll Calls",
+      str_detect(LIST_NAME, regex("EV", ignore_case = TRUE)) ~ "Individual Owns an Electric Vehicle",
+      TRUE ~ "80% or below AMI"
+    )
+  ) %>%
+  select(-sector_match)
+
+
+# BACKUP FOR TESTING
+backup <- convoso
+
+convoso <- backup
+
+### clean
+# prelim columns that are nice to have later on
+cc <- select(convoso, -LEAD_ID)
+
+print(unique(cc$STATUS_NAME))
+
+cc <- cc %>%
+  rename(ENGAGEMENT_LENGTH = TALK_TIME) 
+
+cc$CAMPAIGN_NAME <- "emPOWER Gateway"
+
+impactive_hubdialer_final <- cc
+
+################################################## 
+#  CALL PLATFORM MERGE
+################################################## 
+merge <- rbind(convoso_final, impactive_hubdialer_final)
+
+cc <- merge
+
+# WIPE OUTBOUND CALL COUNT AND RESET TO 1
+cc$OUTBOUND_CALLED_COUNT <- 1
+
+####
+# CONVERSION LOGIC
+print(unique(convoso_final$WORKSHOP_INTEREST))
+# 
+# ADD conversions ### UDATE FOR DIFFERENT CONVERSIONS LATER ON
+### change conversion columns to int
+cc <- cc %>%
+  mutate(
+    WORKSHOP_INTEREST = case_when(
+      WORKSHOP_INTEREST %in% c("Yes to workshop", "Yes", "Decline WS still interested") ~ 1,
+      TRUE                                                  ~ 0
+    ),
+    REBATE_INTEREST   = case_when(
+      REBATE_INTEREST == "Yes" ~ 1,
+      TRUE                     ~ 0
+    ),
+    PROGRAM_INTEREST  = case_when(
+      PROGRAM_INTEREST == "Yes" ~ 1,
+      TRUE                      ~ 0
+    )
+  )
+
+test <- filter (cc, DATE >= '2025-06-15')
+## create conversion column 
+cc <- cc %>%
+  mutate(
+    CONVERSIONS = if_else(
+      WORKSHOP_INTEREST == 1 |
+        PROGRAM_INTEREST  == 1 |
+        REBATE_INTEREST   == 1,
+      1, 0
+    )
+  )
+
+
+# ADD CONVERSION TYPE (MATCH WITH DIGITAL)
+cc <- cc %>%
+  mutate(
+    CONVERSION_TYPE = case_when(
+      PROGRAM_INTEREST == 1 & WORKSHOP_INTEREST == 1 & REBATE_INTEREST == 1 ~ "Program, Workshop & Rebate Interest",
+      PROGRAM_INTEREST == 1 & WORKSHOP_INTEREST == 1                       ~ "Program & Workshop Interest",
+      PROGRAM_INTEREST == 1 & REBATE_INTEREST == 1                        ~ "Program & Rebate Interest",
+      WORKSHOP_INTEREST == 1 & REBATE_INTEREST == 1                       ~ "Workshop & Rebate Interest",
+      PROGRAM_INTEREST == 1                                              ~ "Program Interest",
+      WORKSHOP_INTEREST == 1                                              ~ "Workshop Interest",
+      REBATE_INTEREST == 1                                                ~ "Rebate Interest",
+      TRUE                                                                ~ "None"
+    )
+  )
+
+
+# add impressions (aka dials)
+cc$IMPRESSIONS <- 1
+
+
+# add reach
+cc$REACH <- ifelse(cc$STATUS_NAME %in% c('Human', 'Do NOT Call', 
+                                         'Language Barrier', 'Refused/Hung Up', 'Wrong Number',
+                                           'Moved'), 1, 0)
+# remove status name
+cc <- select(cc, -STATUS_NAME)
+
+###### clean
+play <- cc %>%
+  select(-WORKSHOP_INTEREST, -PROGRAM_INTEREST, -REBATE_INTEREST, -LIST_NAME)
+
+print(colnames(play))
+
+play <- select(cc, PLATFORM, CAMPAIGN_NAME, DATE, NUMBER_DIALED, GEOGRAPHY, LANGUAGE, AUDIENCE, CONVERSION_TYPE, IMPRESSIONS, REACH, 
+               CONVERSIONS, ENGAGEMENT_LENGTH)
+
+play_group <- play %>% 
+  group_by(PLATFORM, CAMPAIGN_NAME, DATE, NUMBER_DIALED, GEOGRAPHY, LANGUAGE, AUDIENCE, CONVERSION_TYPE, REACH) %>% 
+  summarise(IMPRESSIONS = sum(IMPRESSIONS), 
+            CONVERSIONS = sum(CONVERSIONS),
+            AVG_ENGAGEMENT_LENGTH = mean(ENGAGEMENT_LENGTH))
+
+play_group <- play_group %>%
+  mutate(
+    AVG_ENGAGEMENT_LENGTH = as.numeric(AVG_ENGAGEMENT_LENGTH)
+  )
+
+call_final <- play_group
+
+
+################################################## 
+#  PDI CANVASS DATA
+################################################## 
+pdi <- bq_table_download("slstrategy.EMPOWER_2025.PDI_REPORTRAW") 
+
+pdi <- pdi %>%
+  mutate(
+    CONVERSIONS = if_else(REBATE_INTEREST > 0, REBATE_INTEREST, 0)
+  )
+
+# ADD CONVERSION TYPE (MATCH WITH DIGITAL)
+pdi$CONVERSION_TYPE <- "Rebate Interest"
+
+pdi <- select(pdi, -PROGRAM_RECOGNITION, -REBATE_INTEREST)
+
+pdi <- pdi %>%
+  mutate(
+    GEOGRAPHY = stringr::str_to_title(GEOGRAPHY)
+  )
+
+pdi$AVG_ENGAGEMENT_LENGTH <- NA_integer_
+
+pdi$NUMBER_DIALED <- NA_integer_
+
+canvass_final <- pdi
+
+################################################## 
+# TEXTING DATA
+################################################## 
+tth <- bq_table_download("slstrategy.EMPOWER_2025.TTH_REPORTRAW", bigint = "integer64") 
+
+tth$IMPRESSIONS <- 1
+
+# bring in tiny url for conversions 
+url <- bq_table_download("slstrategy.EMPOWER_2025.TINYURL_REPORTRAW", bigint = "integer64") 
+
+url <- url %>%
+  filter(str_detect(tinyurl, regex("empower", ignore_case = TRUE)))
+
+names(url) <- toupper(names(url))
+
+# select columns and add new 
+url <- url %>%
+  mutate(
+    TIME = hms::as_hms(lubridate::ymd_hms(TIMESTAMP))
+  )
+
+url <- select(url, DATE, TIME)
+
+url$CONVERSIONS <- 1
+
+url$CONVERSION_TYPE <- 'Workshop Interest'
+
+#### add conversions to texting dataset
+tth$dt <- as.POSIXct(paste(tth$DATE, tth$TIME), "%Y-%m-%d %H:%M:%S", tz="UTC")
+url$dt <- as.POSIXct(paste(url$DATE, url$TIME), "%Y-%m-%d %H:%M:%S", tz="UTC")
+
+tth_sorted <- tth[order(tth$dt), ]
+tth_dts    <- tth_sorted$dt
+N          <- length(tth_dts)
+
+idx       <- findInterval(url$dt, tth_dts)
+match_idx <- integer(length(idx))
+
+mask_before <- idx == 0
+match_idx[mask_before] <- 1
+
+mask_after <- idx >= N
+match_idx[mask_after] <- N
+
+mask_mid <- !(mask_before | mask_after)
+if (any(mask_mid)) {
+  low <- idx[mask_mid]
+  up  <- low + 1
+  dl  <- abs(url$dt[mask_mid] - tth_dts[low])
+  du  <- abs(url$dt[mask_mid] - tth_dts[up])
+  match_idx[mask_mid] <- ifelse(dl <= du, low, up)
+}
+
+tth_matched <- tth_sorted[match_idx, ]
+result_df   <- cbind(url, tth_matched)
+result_df$dt <- NULL
+
+result_df <- result_df[ , !duplicated(names(result_df)) ]
+
+result_df <- select(result_df, -dt)
+
+tth <- select(tth, -dt)
+tth$CONVERSIONS <- 0
+tth$CONVERSION_TYPE <- "None"
+
+merge <- rbind(result_df, tth)
+merge <- select(merge, -TIME)
+
+merge$AVG_ENGAGEMENT_LENGTH <- NA_integer_
+
+merge <- merge %>%
+  group_by(NUMBER_DIALED) %>%
+  mutate(REACH = if_else(DATE == max(DATE), 1, 0)) %>%
+  ungroup()
+
+text_final <- merge
+
+#############################################################
+# OUTREACH MERGE
+#############################################################
+outreach_final <- rbind(call_final, canvass_final, text_final)
+
+#############################################################
+# DIGIAL + OUTREACH MERGE
+#############################################################
+
+### outreach clean
+outreach_clean <- outreach_final
+
+outreach_clean$VIDEO_VIEWS_AT_25 <- NA_integer_
+outreach_clean$VIDEO_VIEWS_AT_50 <- NA_integer_
+outreach_clean$VIDEO_VIEWS_AT_75 <- NA_integer_
+outreach_clean$VIDEO_VIEWS_AT_100 <- NA_integer_
+outreach_clean$CPR <- NA_integer_
+outreach_clean$CPC_DESTINATION <- NA_integer_
+outreach_clean$CPM <- NA_integer_
+outreach_clean$CPR <- NA_integer_
+outreach_clean$CTR_DESTINATION <- NA_integer_
+outreach_clean$AMOUNT_SPENT_USD <- NA_integer_
+
+
+outreach_clean$AD_GROUP_NAME <- NA_character_
+outreach_clean$AD_NAME <- NA_character_
+outreach_clean$MESSAGING <- NA_character_
+
+outreach_clean <- outreach_clean %>%
+  mutate(
+    AD_TYPE = case_when(
+      PLATFORM == "PDI"                                     ~ "Door to Door Canvass",
+      PLATFORM %in% c("Impactive.io", "Hubdialer", "Convoso")  ~ "Phone Canvass",
+      PLATFORM %in% c("Teletown Hall", "Prompt.io")           ~ "Text Canvass",
+      TRUE                                                   ~ NA_character_
+    )
+  )
+
+outreach_clean$CAMPAIGN_NAME <- "emPOWER Gateway"
+
+outreach_clean$MARKETING_TYPE <- "Community Outreach"
+
+outreach_clean <- outreach_clean %>%
+  mutate(NUMBER_DIALED = as.character(NUMBER_DIALED))
+
+### digital clean
+digital_clean <- digital_final_temp
+
+digital_clean <- digital_clean %>%
+  rename(CONVERSION_TYPE = CALL_TO_ACTION)
+
+digital_clean <- digital_clean %>%
+  rename(AVG_ENGAGEMENT_LENGTH = VIDEO_AVERAGE_PLAY_TIME)
+
+digital_clean$NUMBER_DIALED <- NA_character_
+
+names(digital_clean) <- toupper(names(digital_clean))
+
+digital_clean$MARKETING_TYPE <- "Digital Marketing"
+
+outreach_clean$FREQUENCY <- NA
+
+outreach_clean <- outreach_clean %>%
+  mutate(across(where(~ inherits(.,"integer64")), ~ as.integer(as.numeric(.))))
+
+digital_clean <- digital_clean %>%
+  mutate(across(where(~ inherits(.,"integer64")), ~ as.integer(as.numeric(.))))
+
+
+################################################################ # DEMOGRAPHICS
+# ADD IN PDI DATA FOR INDIVIDUAL OUTREACH DEMOS
+# FOR CALLING AND TEXTING DATA
+################################################################
+tbl <- bq_table("slstrategy", "EMPOWER_2025", "DEMOGRAPHIC_DATABASE")
+
+# download in pages of 20k rows, but keep 64-bit ints intact
+demos <- bq_table_download(
+  tbl,
+  page_size = 20000,
+  bigint    = "integer64"
+)
+
+
+demo_clean <- select(demos, LANGUAGE, V1_AGE, V1_ETHNICITY, V1_GENDER, V1_PDIID, RA_ZIP, GEOGRAPHY, 
+                     CITYCODE, PHONENUMBER, WIRELESSPHONENUMBER)
+
+demo_clean <- demo_clean %>%
+  mutate(CITYCODE = str_remove(CITYCODE, "^CA - "))
+
+demo_clean <- demo_clean %>%
+  mutate(
+    WIRELESSPHONENUMBER = coalesce(WIRELESSPHONENUMBER, PHONENUMBER)
+  )
+
+print(colnames(demo_clean))
+
+demo_clean <- select(demo_clean, -PHONENUMBER, -V1_PDIID)
+
+demo_clean <- demo_clean %>% 
+  distinct()
+# Total number of duplicate entries
+demo_clean <- demo_clean %>% 
+  distinct()
+
+dup_count_total <- sum(duplicated(demo_clean$WIRELESSPHONENUMBER))
+print(dup_count_total)
+
+demo_clean <- demo_clean %>%
+  distinct(WIRELESSPHONENUMBER, .keep_all = TRUE)
+
+demo_clean <- demo_clean %>%
+  mutate(
+    GEOGRAPHY = paste(GEOGRAPHY, CITYCODE, sep = " - ")
+  ) %>%
+  select(-CITYCODE)
+
+demo_clean <- demo_clean %>%
+  mutate(
+    V1_AGE       = coalesce(as.character(V1_AGE), "Unknown"),
+    V1_ETHNICITY = coalesce(V1_ETHNICITY,  "Unknown"),
+    V1_GENDER    = coalesce(V1_GENDER,     "Unknown")
+  )
+
+demo_clean <- demo_clean %>%
+  rename(AD_GROUP_NAME = RA_ZIP)
+
+
+library(dplyr)
+
+ethnicity_map <- c(
+  S  = "Latino",
+  SS = "Latino",
+  AS = "African American",
+  O  = "Arabic",
+  OO = "Arabic",
+  A  = "Armenian",
+  AR = "Armenian",
+  E  = "East Indian",
+  EE = "East Indian",
+  G  = "Greek",
+  GG = "Greek",
+  I  = "Italian",
+  II = "Italian",
+  J  = "Jewish",
+  JJ = "Jewish",
+  H  = "Jewish Probable",
+  HH = "Jewish Probable",
+  D  = "Pacific Islander",
+  DD = "Pacific Islander",
+  B  = "Persian",
+  BB = "Persian",
+  P  = "Portuguese",
+  PP = "Portuguese",
+  R  = "Russian",
+  RR = "Russian",
+  M  = "AsianAnglo",
+  MM = "AsianAnglo",
+  C  = "Chinese",
+  CC = "Chinese",
+  F  = "Filipino",
+  FF = "Filipino",
+  N  = "Japanese",
+  NN = "Japanese",
+  K  = "Korean",
+  KK = "Korean",
+  L  = "Southeast Asian",
+  LL = "Southeast Asian",
+  V  = "Vietnamese",
+  VV = "Vietnamese",
+  W  = "Chinese / Korean",
+  WW = "Chinese / Korean",
+  Z  = "Chinese / Vietnamese",
+  ZZ = "Chinese / Vietnamese",
+  U  = "Chinese / Korean / Vietnamese",
+  UU = "Chinese / Korean / Vietnamese"
+)
+
+demo_clean <- demo_clean %>%
+  mutate(
+    ETHNICITY_DESC = ethnicity_map[V1_ETHNICITY],
+    ETHNICITY_DESC = ifelse(
+      is.na(ETHNICITY_DESC),
+      "Unknown/White/Other",
+      ETHNICITY_DESC
+    )
+  )
+
+
+demo_clean <- demo_clean %>%
+  mutate(
+    V1_GENDER = recode(
+      V1_GENDER,
+      "M" = "Male",
+      "F" = "Female",
+      .default = "Unknown"
+    )
+  )
+
+demo_clean <- demo_clean %>%
+  mutate(
+    V1_AGE = as.integer(V1_AGE)
+  ) %>%
+  mutate(
+    AGE_BUCKET = cut(
+      V1_AGE,
+      breaks = c(18, 30, 40, 50, 60, 70, Inf),
+      labels = c("18-30", "30-40", "40-50", "50-60", "60-70", "70+"),
+      right = FALSE,
+      include.lowest = TRUE
+    )
+  )
+
+demo_clean <- demo_clean %>%
+  mutate(
+    AUDIENCE = paste(ETHNICITY_DESC, AGE_BUCKET, V1_GENDER, sep = ", ")
+  )
+
+print(colnames(demo_clean))
+
+demo_1 <- select(demo_clean, LANGUAGE, AD_GROUP_NAME, GEOGRAPHY, WIRELESSPHONENUMBER,
+                 AUDIENCE)
+
+demo_1 <- demo_1 %>%
+  rename(NUMBER_DIALED = WIRELESSPHONENUMBER) %>%
+  mutate(
+    NUMBER_DIALED = as.character(NUMBER_DIALED)
+  )
+
+demo_1 <- demo_1 %>%
+  rename_with(
+    ~ paste0(., "_REPLACEMENT"),
+    -NUMBER_DIALED
+  )
+
+demo_1 <- demo_1 %>%
+  mutate(
+    AD_GROUP_NAME_REPLACEMENT = as.character(AD_GROUP_NAME_REPLACEMENT)
+  )
+
+
+### outreach merge
+outreach_work <- outreach_clean
+
+# trim whitespace on NUMBER_DIALED
+demo_1 <- demo_1 %>%
+  mutate(NUMBER_DIALED = str_trim(NUMBER_DIALED))
+
+outreach_work <- outreach_work %>%
+  mutate(NUMBER_DIALED = str_trim(NUMBER_DIALED))
+
+# left-join outreach_work with demo_1 by NUMBER_DIALED
+outreach_merge <- outreach_work %>%
+  left_join(demo_1, by = "NUMBER_DIALED")
+
+rep_cols <- grep("_REPLACEMENT$", names(outreach_merge), value = TRUE)
+
+# Loop over them, coalescing into the original columns
+for(rep in rep_cols) {
+  orig <- sub("_REPLACEMENT$", "", rep)
+  outreach_merge[[orig]] <- ifelse(
+    !is.na(outreach_merge[[rep]]),
+    outreach_merge[[rep]],
+    outreach_merge[[orig]]
+  )
+}
+
+
+outreach_merge <- outreach_merge %>%
+  select(-ends_with("_REPLACEMENT"))
+################################################################
+# Marketing bind
+################################################################
+### bind
+final_table <- rbind(digital_clean, outreach_merge)
+
+# OUTREACH MISSING
+# FREQUENCY 
+# AD_GROUP_NAME
+# AD_NAME
+# MESSAGING
+# AD_TYPE
+# CALL_TO_ACTION
+
+# DIGITAL MISSING
+# NUMBER_DIALED
+# CONVERSION_TYPE
+# AVG_ENGAGEMENT_LENGTH
+################################################## 
+# CALENDLY DATA
+################################################## 
+calendly <- bq_table_download("slstrategy.EMPOWER_2025.CALENDLY_REPORTRAW", bigint = "integer64") 
+
+calendly$IMPRESSIONS <- 1
+
+calendly$REACH <- 1
+
+### outreach clean
+outreach_clean <- calendly
+
+outreach_clean$VIDEO_VIEWS_AT_25 <- NA_integer_
+outreach_clean$VIDEO_VIEWS_AT_50 <- NA_integer_
+outreach_clean$VIDEO_VIEWS_AT_75 <- NA_integer_
+outreach_clean$VIDEO_VIEWS_AT_100 <- NA_integer_
+outreach_clean$CPR <- NA_integer_
+outreach_clean$CPC_DESTINATION <- NA_integer_
+outreach_clean$CPM <- NA_integer_
+outreach_clean$CPR <- NA_integer_
+outreach_clean$CTR_DESTINATION <- NA_integer_
+outreach_clean$AMOUNT_SPENT_USD <- NA_integer_
+outreach_clean$FREQUENCY <- NA_integer_
+outreach_clean$AVG_ENGAGEMENT_LENGTH <- NA_integer_
+
+
+outreach_clean$MESSAGING <- NA_character_
+outreach_clean$MARKETING_TYPE <- "Community Workshops"
+outreach_clean$AD_GROUP_NAME <- NA_character_
+outreach_clean$AD_TYPE <- "Workshop Registrant"
+outreach_clean$CAMPAIGN_NAME <- "emPOWER Gateway"
+
+
+
+calendly <- outreach_clean
+
+############################################################# calendly to final bind
+#
+test <- rbind(calendly, final_table)
+#
+#
+#
+final_table <- test
+#
+final_table <- final_table %>%
+  mutate(NUMBER_DIALED = as.character(NUMBER_DIALED))
+
+final_table <- final_table %>%
+  mutate(
+    CONVERSION_TYPE = str_trim(CONVERSION_TYPE),
+    CONVERSION_TYPE = str_replace_all(CONVERSION_TYPE, "\n", " "),
+    CONVERSION_TYPE = str_remove_all(CONVERSION_TYPE, "/.*"), 
+    CONVERSION_TYPE = str_to_title(str_trim(CONVERSION_TYPE))  
+  )
+############################################################# 
+# Create BigQuery table
+#################################################################
+project_id <- "slstrategy"
+dataset_id <- "EMPOWER_2025"
+table_id <- "EMPOWER_SOURCE1"
+
+# Create a table reference
+table_ref <- bq_table(project = project_id, dataset = dataset_id, table = table_id)
+
+# Check if the table exists
+if (bq_table_exists(table_ref)) {
+  bq_table_delete(table_ref)
+}
+
+# Define the schema based on `joined`
+schema <- list(
+  bq_field("PLATFORM", "STRING"),
+  bq_field("DATE", "DATE"), 
+  bq_field("CAMPAIGN_NAME", "STRING"),
+  bq_field("AD_NAME", "STRING"),  
+  bq_field("AD_GROUP_NAME", "STRING"),  
+  bq_field("LANGUAGE", "STRING"),
+  bq_field("AMOUNT_SPENT_USD", "FLOAT64"),
+  bq_field("CONVERSIONS", "INT64"),
+  bq_field("CPC_DESTINATION", "FLOAT64"),
+  bq_field("CTR_DESTINATION", "FLOAT64"),
+  bq_field("REACH", "INT64"),
+  bq_field("CPR", "FLOAT64"),
+  bq_field("IMPRESSIONS", "INT64"),
+  bq_field("CPM", "FLOAT64"),
+  bq_field("FREQUENCY", "FLOAT64"),
+  bq_field("VIDEO_VIEWS_AT_100", "INT64"),
+  bq_field("VIDEO_VIEWS_AT_75", "INT64"),
+  bq_field("VIDEO_VIEWS_AT_50", "INT64"),
+  bq_field("VIDEO_VIEWS_AT_25", "INT64"),
+  bq_field("AVG_ENGAGEMENT_LENGTH", "FLOAT64"),
+  bq_field("CONVERSION_TYPE", "STRING"),
+  bq_field("NUMBER_DIALED", "STRING"),
+  bq_field("MESSAGING", "STRING"),
+  bq_field("AUDIENCE", "STRING"),
+  bq_field("GEOGRAPHY", "STRING"),
+  bq_field("AD_TYPE", "STRING"),
+  bq_field("MARKETING_TYPE", "STRING")
+)
+
+
+# Upload the data
+tryCatch({
+  bq_table_create(table_ref, fields = schema)
+  bq_table_upload(table_ref, values = final_table)
+  cat("Table created and data uploaded successfully!\n")
+}, error = function(e) {
+  cat("An error occurred:", conditionMessage(e), "\n")
+})
