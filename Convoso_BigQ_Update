@@ -1,0 +1,64 @@
+# Load required libraries
+library(bigrquery)
+library(curl)
+library(dplyr)
+library(lubridate)
+library(httpuv)
+library(base)
+library(googledrive)
+library(stringr)
+library(tidyr)
+library(readxl)
+unloadNamespace("plyr")
+
+#################################### 
+#################################### 
+# CONVOSO
+#################################### 
+#################################### OVERWRITES
+
+# change path for daily call report drop 
+upload <- read.csv('/Users/birdieligos/Downloads/log_107910_31czxwueg6uq0s469uqvokhrk0ac8v62_2025-06-22_21_01_19.csv', stringsAsFactors = FALSE)
+
+# format
+colnames(upload) <- gsub("\\.", "_", colnames(upload))
+
+upload <- upload %>%
+  mutate(
+    ts   = ymd_hms(Time_Stamp__PST_),
+    Date = as.Date(ts),
+    Time = format(ts, "%H:%M:%S")
+  ) %>%
+  select(-Time_Stamp__PST_, -ts)
+
+upload <- upload %>%
+  mutate(
+    ts   = ymd_hms(Final_Reached_At),
+    Final_Reach_Date = as.Date(ts),
+    Final_Reach_Time = format(ts, "%H:%M:%S")
+  ) %>%
+  select(-Final_Reached_At, -ts)
+
+upload <- upload %>%
+  mutate(
+    ts   = ymd_hms(Created_At__Time_),
+    Created_Lead_Date = as.Date(ts),
+    Created_Lead_Time = format(ts, "%H:%M:%S")
+  ) %>%
+  select(-Created_At__Time_, -ts)
+
+upload <- select(upload, Date, Lead_ID, Number_Dialed, Status_Name, Talk_Time, Cost, Outbound_Called_Count,
+                 Campaign_Name,	List_Name, Final_Reach_Date, Final_Reach_Time, Created_Lead_Date,
+                 Created_Lead_Time, PROGRAM_RECOGNITION, SCE_CUSTOMER, WORKSHOP_INTEREST)
+
+upload$PLATFORM <- 'Convoso'
+
+
+################# OVERWRITES write big query table 
+library(bigrquery)
+
+# Set up the BigQuery table reference
+bq_table <- bq_table(project = "slstrategy", dataset = "EMPOWER_2025", table = "CONVOSO_REPORTRAW")
+
+# Append data to the BigQuery table
+bq_table_upload(bq_table, upload, write_disposition = "WRITE_TRUNCATE")
