@@ -15,16 +15,23 @@ unloadNamespace("plyr")
 ############################################################# 
 meta <- bq_table_download("slstrategy.EMPOWER_2025.METAREPORT_RAW", bigint = "integer64")
 
+meta <- meta %>%
+  filter(
+    !(str_detect(CAMPAIGN_NAME, "THMC") & 
+        !str_detect(CAMPAIGN_NAME, "emPower"))
+  )
 # MISSING ADD TYPE AND CANGT LOG IN RN
+print(unique(meta$CAMPAIGN_NAME))
+print(unique(meta$AD_GROUP_NAME))
 print(unique(meta$AD_NAME))
 # MIGHT FIX LATER 
 meta$MESSAGING <- meta$AD_NAME
 meta <- meta %>%
   mutate(
     AD_TYPE = case_when(
-      str_detect(AD_GROUP_NAME, regex("Workshop|Event|gratuito", ignore_case = TRUE)) ~ "Event Promotion",
-      str_detect(AD_GROUP_NAME, regex("Hotline", ignore_case = TRUE))               ~ "Hotlines",
-      str_detect(AD_GROUP_NAME, regex("Promotion", ignore_case = TRUE))             ~ "Program Promotion",
+      str_detect(CAMPAIGN_NAME, regex("Workshop|Event|gratuito|Promotion|Promoting|Post|Leads", ignore_case = TRUE)) ~ "Static",
+      str_detect(CAMPAIGN_NAME, regex("Hotline", ignore_case = TRUE))               ~ "Hotline",
+      str_detect(CAMPAIGN_NAME, regex("Direct", ignore_case = TRUE))             ~ "Direct Social",
       TRUE                                                                           ~ AD_NAME
     )
   )
@@ -44,18 +51,37 @@ meta <- meta %>%
 meta <- meta %>%
   mutate(
     LANGUAGE = case_when(
-      str_detect(AD_NAME, regex("English", ignore_case = TRUE)) ~ "English",
-      str_detect(AD_NAME, regex("Spanish", ignore_case = TRUE)) ~ "Spanish",
+      str_detect(AD_NAME, regex("English|ENG", ignore_case = TRUE)) ~ "English",
+      str_detect(AD_NAME, regex("Spanish|SP", ignore_case = TRUE)) ~ "Spanish",
       TRUE                                                     ~ "Bilingual"
     )
   )
 
 # geography and audience 
-meta <- meta %>%
-  mutate(
-    Geography = if_else(DATE <= as.Date("2024-12-30"), "Sector 1", NA_character_),
-    Audience  = if_else(DATE <= as.Date("2024-12-30"), "Individual Automotive", NA_character_)
+library(dplyr); library(stringr)
+
+meta <- meta %>% mutate(
+  Geography = case_when(
+    str_detect(CAMPAIGN_NAME, regex("THMC", ignore_case=TRUE)) ~
+      str_replace(
+        str_extract(AD_GROUP_NAME, "Sector[0-9]+"),
+        "([A-Za-z]+)([0-9]+)",
+        "\\1 \\2"
+      ),
+    DATE <= as.Date("2024-12-30") ~ "Sector 1",
+    TRUE ~ "Unspecified"
+  ),
+  Audience = case_when(
+    str_detect(CAMPAIGN_NAME, regex("THMC", ignore_case=TRUE)) ~
+      str_replace_all(
+        str_extract(AD_GROUP_NAME, "(?<=Social_)[^_]+"),
+        "([a-z])([A-Z])",
+        "\\1 \\2"
+      ),
+    DATE <= as.Date("2024-12-30") ~ "Individual Automotive",
+    TRUE ~ "Unspecified"
   )
+)
 
 # campaign name
 meta <- meta %>%
@@ -599,33 +625,36 @@ demos <- bq_table_download(
   bigint    = "integer64"
 )
 
+library(tidyr)
+library(dplyr)
 
-demo_clean <- select(demos, LANGUAGE, V1_AGE, V1_ETHNICITY, V1_GENDER, V1_PDIID, RA_ZIP, GEOGRAPHY, 
-                     CITYCODE, PHONENUMBER, WIRELESSPHONENUMBER)
+demos_long <- demos %>%
+  pivot_longer(
+    cols = c(PHONENUMBER, WIRELESSPHONENUMBER),
+    names_to = "PHONE_TYPE",
+    values_to = "NUMBER_DIALED"
+  ) %>%
+  mutate(
+    PHONE_TYPE = case_when(
+      PHONE_TYPE == "PHONENUMBER" ~ "Landline",
+      PHONE_TYPE == "WIRELESSPHONENUMBER" ~ "Mobile"
+    )
+  ) %>%
+  filter(!is.na(NUMBER_DIALED) & NUMBER_DIALED != "")
+
+print(colnames(demos))
+
+demo_clean <- select(demos_long, LANGUAGE, V1_AGE, V1_ETHNICITY, V1_GENDER, V1_PDIID, RA_ZIP, GEOGRAPHY, 
+                     CITYCODE, NUMBER_DIALED)
 
 demo_clean <- demo_clean %>%
   mutate(CITYCODE = str_remove(CITYCODE, "^CA - "))
 
-demo_clean <- demo_clean %>%
-  mutate(
-    WIRELESSPHONENUMBER = coalesce(WIRELESSPHONENUMBER, PHONENUMBER)
-  )
 
-print(colnames(demo_clean))
-
-demo_clean <- select(demo_clean, -PHONENUMBER, -V1_PDIID)
+demo_clean <- select(demo_clean, -V1_PDIID)
 
 demo_clean <- demo_clean %>% 
   distinct()
-# Total number of duplicate entries
-demo_clean <- demo_clean %>% 
-  distinct()
-
-dup_count_total <- sum(duplicated(demo_clean$WIRELESSPHONENUMBER))
-print(dup_count_total)
-
-demo_clean <- demo_clean %>%
-  distinct(WIRELESSPHONENUMBER, .keep_all = TRUE)
 
 demo_clean <- demo_clean %>%
   mutate(
@@ -717,6 +746,11 @@ demo_clean <- demo_clean %>%
 
 demo_clean <- demo_clean %>%
   mutate(
+    V1_AGE = na_if(V1_AGE, "Unknown")
+  )
+
+demo_clean <- demo_clean %>%
+  mutate(
     V1_AGE = as.integer(V1_AGE)
   ) %>%
   mutate(
@@ -736,14 +770,8 @@ demo_clean <- demo_clean %>%
 
 print(colnames(demo_clean))
 
-demo_1 <- select(demo_clean, LANGUAGE, AD_GROUP_NAME, GEOGRAPHY, WIRELESSPHONENUMBER,
+demo_1 <- select(demo_clean, LANGUAGE, AD_GROUP_NAME, GEOGRAPHY, NUMBER_DIALED,
                  AUDIENCE)
-
-demo_1 <- demo_1 %>%
-  rename(NUMBER_DIALED = WIRELESSPHONENUMBER) %>%
-  mutate(
-    NUMBER_DIALED = as.character(NUMBER_DIALED)
-  )
 
 demo_1 <- demo_1 %>%
   rename_with(
@@ -767,6 +795,10 @@ demo_1 <- demo_1 %>%
 outreach_work <- outreach_work %>%
   mutate(NUMBER_DIALED = str_trim(NUMBER_DIALED))
 
+demo_1 <- demo_1 %>%
+  filter(!is.na(NUMBER_DIALED)) %>%
+  distinct(NUMBER_DIALED, .keep_all = TRUE)
+
 # left-join outreach_work with demo_1 by NUMBER_DIALED
 outreach_merge <- outreach_work %>%
   left_join(demo_1, by = "NUMBER_DIALED")
@@ -786,6 +818,40 @@ for(rep in rep_cols) {
 
 outreach_merge <- outreach_merge %>%
   select(-ends_with("_REPLACEMENT"))
+
+# report 
+report <- outreach_merge
+
+report <- report %>%
+  filter(as.Date(DATE) >= as.Date("2025-01-10"))
+
+report <- report %>%
+  mutate(
+    TYPE = case_when(
+      PLATFORM %in% c("Convoso", "Hubdialer", "Impactive.io") ~ "Phones",
+      PLATFORM == "PDI" ~ "Door to Door",
+      PLATFORM == "Teletown Hall" ~ "Texts",
+      TRUE ~ "Other"
+    )
+  )
+
+report <- report %>%
+  ungroup() %>%
+  select(GEOGRAPHY, TYPE, IMPRESSIONS, REACH)
+
+report <- select(report, GEOGRAPHY, TYPE, IMPRESSIONS, REACH)
+
+report_summary <- report %>%
+  group_by(GEOGRAPHY, TYPE) %>%
+  summarise(
+    TOTAL_IMPRESSIONS = sum(IMPRESSIONS, na.rm = TRUE),
+    TOTAL_REACH = sum(REACH, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(report_summary, file = '/Users/birdieligos/Documents/Reports/empower_outreach_bygeo070225.csv', row.names = FALSE)
+
+print(unique(outreach_merge$PLATFORM))
 ################################################################
 # Marketing bind
 ################################################################
@@ -913,3 +979,4 @@ tryCatch({
 }, error = function(e) {
   cat("An error occurred:", conditionMessage(e), "\n")
 })
+
