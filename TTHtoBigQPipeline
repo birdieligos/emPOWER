@@ -1,13 +1,7 @@
-# Set up the BigQuery table reference
-bq_table <- bq_table(project = "slstrategy", dataset = "EMPOWER_2025", table = "PDI_REPORTRAW")
-
-# Append data to the BigQuery table
-bq_table_upload(bq_table, upload, write_disposition = "WRITE_TRUNCATE")
-########################################
 ########################################
 # TEXTING DATA
 ######################################## 
-######################################## APPENDS
+######################################## OVERWRITES
 
 # Vector of only the highlighted file paths (replace with the exact filenames you selected)
 highlighted_files <- c(
@@ -48,13 +42,13 @@ combined <- purrr::map_dfr(highlighted_files, process_file)
 text_ext <- combined %>%
   select(-LIST_NAME)
 
-
-############################## APPENDS write big query table 
+# 
+############################## TRUNCATE write big query table 
 library(bigrquery)
 
 # Set up the BigQuery table reference
-bq_table <- bq_table(project = "slstrategy", dataset = "EMPOWER_2025", table = "TTH_REPORTRAW")
+bq_table <- bq_table(project = "slstrategy", dataset = "EMPOWER_2025", table = "TTH_REPORTRAW_TEST")
 
 # Append data to the BigQuery table
-bq_table_upload(bq_table, text_ext, write_disposition = "WRITE_APPEND")
+bq_table_upload(bq_table, text_ext, write_disposition = "WRITE_TRUNCATE")
 
