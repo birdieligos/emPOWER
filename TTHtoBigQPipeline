@@ -1,0 +1,60 @@
+# Set up the BigQuery table reference
+bq_table <- bq_table(project = "slstrategy", dataset = "EMPOWER_2025", table = "PDI_REPORTRAW")
+
+# Append data to the BigQuery table
+bq_table_upload(bq_table, upload, write_disposition = "WRITE_TRUNCATE")
+########################################
+########################################
+# TEXTING DATA
+######################################## 
+######################################## APPENDS
+
+# Vector of only the highlighted file paths (replace with the exact filenames you selected)
+highlighted_files <- c(
+  '/Users/birdieligos/Downloads/extended_report_123906 (1).xlsx',
+  '/Users/birdieligos/Downloads/extended_report_123986.xlsx',
+  '/Users/birdieligos/Downloads/extended_report_124134.xlsx',
+  '/Users/birdieligos/Downloads/extended_report_124135.xlsx',
+  '/Users/birdieligos/Downloads/extended_report_124145.xlsx'
+)
+
+process_file <- function(path) {
+  text_ext <- read_excel(path, sheet = "Dialogs") %>%
+    select(phone, ts)
+  
+  list_name <- read_excel(path, sheet = "Totals", range = "B2", col_names = FALSE)[[1,1]]
+  
+  text_ext %>%
+    mutate(
+      LIST_NAME    = list_name,
+      LANGUAGE     = case_when(
+        str_detect(LIST_NAME, regex("ENGLISH", ignore_case = TRUE)) ~ "English",
+        str_detect(LIST_NAME, regex("SPANISH", ignore_case = TRUE)) ~ "Spanish",
+        TRUE                                                         ~ "English"
+      ),
+      GEOGRAPHY     = "Sector 1",
+      AUDIENCE      = "80% or Below AMI",
+      PLATFORM      = "Teletown Hall",
+      CAMPAIGN_NAME = "emPOWER Gateway",
+      DATE          = as.Date(ymd_hms(ts)),
+      TIME          = format(ymd_hms(ts), "%H:%M:%S")  # time only
+    ) %>%
+    select(-ts) %>%
+    rename(NUMBER_DIALED = phone)
+}
+
+combined <- purrr::map_dfr(highlighted_files, process_file)
+
+text_ext <- combined %>%
+  select(-LIST_NAME)
+
+
+############################## APPENDS write big query table 
+library(bigrquery)
+
+# Set up the BigQuery table reference
+bq_table <- bq_table(project = "slstrategy", dataset = "EMPOWER_2025", table = "TTH_REPORTRAW")
+
+# Append data to the BigQuery table
+bq_table_upload(bq_table, text_ext, write_disposition = "WRITE_APPEND")
+
